@@ -39,6 +39,11 @@ _HELP_MSG = (
     "/digest this_week     – digest for this week\n"
     "/digest last_week     – digest for last week\n"
     "/digest 2026-02-25    – digest for a specific date\n\n"
+    "Background Tasks\n"
+    "/backrun <task>       – run a long agentic task in the background\n"
+    "/bgtasks              – list all background tasks and their status\n"
+    "/bgresult <n>         – get the result of a completed task (sends .md)\n"
+    "/bgcancel <n>         – cancel a running background task\n\n"
     "Saying hi (hi / hello / 你好 …) also shows the status panel.\n\n"
     "Just type any research question and I'll answer it!"
 )
@@ -141,6 +146,22 @@ class CommandsMixin:
             self._send(chat_id, "Cancelled.")
             return True
 
+        if cmd == "/backrun":
+            self._handle_backrun(chat_id, args)
+            return True
+
+        if cmd == "/bgtasks":
+            self._handle_bgtasks(chat_id)
+            return True
+
+        if cmd == "/bgresult":
+            self._handle_bgresult(chat_id, args)
+            return True
+
+        if cmd == "/bgcancel":
+            self._handle_bgcancel(chat_id, args)
+            return True
+
         # Pending two-step flows (only for plain messages, not commands)
         if not cmd:
             if chat_id in self._pending_delete:
@@ -180,6 +201,16 @@ class CommandsMixin:
         mem = get_memory_store().stats()
         notes = get_note_store().stats()
 
+        from ..bg_task_store import get_bg_task_store
+        bg_tasks = get_bg_task_store().list_tasks(chat_id)
+        running = [t for t in bg_tasks if t.status == "running"]
+        pending = [t for t in bg_tasks if t.status == "pending"]
+        done    = [t for t in bg_tasks if t.status == "done"]
+        bg_line = (
+            f"{len(running)} running, {len(pending)} pending, {len(done)} done"
+            if bg_tasks else "no tasks yet"
+        )
+
         lines = [
             "── XivBot Status ──────────────────",
             "",
@@ -187,6 +218,7 @@ class CommandsMixin:
             f"Sessions  {len(sessions)} total",
             f"Memory    {mem['papers_memorised']} papers  ({mem['days_with_activity']} days)",
             f"Notes     {notes['total_notes']} notes on {notes['papers_with_notes']} papers",
+            f"BG Tasks  {bg_line}",
             "",
             "Active session",
             f"  {session_line}",
@@ -200,6 +232,10 @@ class CommandsMixin:
             "  /note              add note on last-read paper",
             "  /note <arxiv_id>   add note on specific paper",
             "  /digest [period]   generate reading digest (today/this_week/…)",
+            "  /backrun <task>    run a long task in the background",
+            "  /bgtasks           list background tasks",
+            "  /bgresult <n>      get result of a completed task",
+            "  /bgcancel <n>      cancel a running task",
             "  /status            show this panel",
             "  /help              full help",
             "",
@@ -521,3 +557,157 @@ class CommandsMixin:
                 self._send(chat_id, preview)
         except Exception as exc:
             self._send(chat_id, f"Failed to generate digest: {exc}")
+
+    # ── Background task handlers ──────────────────────────────────────────────
+
+    def _handle_backrun(self, chat_id: str, args: list) -> None:
+        if not args:
+            self._send(
+                chat_id,
+                "Usage: /backrun <task description>\n"
+                "Example: /backrun 帮我调研 50 篇今年的 agentic memory paper，全部写好笔记，最后给我 md"
+            )
+            return
+
+        prompt = " ".join(args)
+        from ..agent_runner import get_bg_runner
+        runner = get_bg_runner(verbose=self.verbose)
+        task_id = runner.submit(chat_id, prompt)
+        short_id = task_id[-6:]
+        self._send(
+            chat_id,
+            f"Background task started  [id: {short_id}]\n\n"
+            f"Task: {prompt[:100]}{'…' if len(prompt) > 100 else ''}\n\n"
+            f"Use /bgtasks to check status.\n"
+            f"Use /bgresult {short_id} to get the result when done."
+        )
+
+    def _handle_bgtasks(self, chat_id: str) -> None:
+        from ..bg_task_store import get_bg_task_store
+        tasks = get_bg_task_store().list_tasks(chat_id)
+
+        if not tasks:
+            self._send(
+                chat_id,
+                "No background tasks yet.\n"
+                "Use /backrun <task> to start one."
+            )
+            return
+
+        _STATUS_ICON = {
+            "pending":   "⏳",
+            "running":   "🔄",
+            "done":      "✅",
+            "failed":    "❌",
+            "cancelled": "🚫",
+        }
+
+        lines = ["Background Tasks\n"]
+        for i, t in enumerate(tasks, 1):
+            icon = _STATUS_ICON.get(t.status, "?")
+            ts = ""
+            if t.status == "running" and t.started_at:
+                ts = f"  started: {t.started_at[:16].replace('T', ' ')}"
+            elif t.status in ("done", "failed", "cancelled") and t.finished_at:
+                ts = f"  finished: {t.finished_at[:16].replace('T', ' ')}"
+            elif t.status == "pending" and t.created_at:
+                ts = f"  created: {t.created_at[:16].replace('T', ' ')}"
+
+            hint = ""
+            if t.status == "done":
+                hint = f"  → /bgresult {t.short_id()}"
+            elif t.status == "failed" and t.error:
+                hint = f"\n   error: {t.error[:80]}"
+            elif t.status == "running":
+                hint = f"  → /bgcancel {t.short_id()} to cancel"
+
+            lines.append(
+                f"{i}. [{t.short_id()}] {icon} {t.status:<10}  {t.prompt_preview()}\n"
+                f"  {ts}{hint}"
+            )
+
+        self._send(chat_id, "\n".join(lines))
+
+    def _handle_bgresult(self, chat_id: str, args: list) -> None:
+        if not args:
+            self._send(chat_id, "Usage: /bgresult <task_number_or_id>")
+            return
+
+        from ..bg_task_store import get_bg_task_store
+        import os
+        store = get_bg_task_store()
+        task = store.resolve(chat_id, args[0])
+
+        if task is None:
+            self._send(chat_id, f"Task not found: {args[0]}\nUse /bgtasks to list tasks.")
+            return
+
+        if task.status == "running":
+            self._send(chat_id, f"Task [{task.short_id()}] is still running. Check back later with /bgtasks.")
+            return
+
+        if task.status == "pending":
+            self._send(chat_id, f"Task [{task.short_id()}] is queued and hasn't started yet.")
+            return
+
+        if task.status == "cancelled":
+            self._send(chat_id, f"Task [{task.short_id()}] was cancelled.")
+            return
+
+        if task.status == "failed":
+            self._send(chat_id, f"Task [{task.short_id()}] failed.\nError: {task.error or 'unknown error'}")
+            return
+
+        # status == "done"
+        if not task.result_file or not os.path.exists(task.result_file):
+            self._send(chat_id, f"Result file for task [{task.short_id()}] is missing.")
+            return
+
+        filename = os.path.basename(task.result_file)
+        sent = self._send_document(chat_id, task.result_file, filename)
+        if not sent:
+            try:
+                text = open(task.result_file, encoding="utf-8").read()
+                preview = text[:3000] + ("\n\n…(truncated)" if len(text) > 3000 else "")
+                self._send(chat_id, preview)
+            except Exception as exc:
+                self._send(chat_id, f"Failed to read result: {exc}")
+
+    def _handle_bgcancel(self, chat_id: str, args: list) -> None:
+        if not args:
+            self._send(chat_id, "Usage: /bgcancel <task_number_or_id>")
+            return
+
+        from ..bg_task_store import get_bg_task_store
+        from ..agent_runner import get_bg_runner
+        store = get_bg_task_store()
+        task = store.resolve(chat_id, args[0])
+
+        if task is None:
+            self._send(chat_id, f"Task not found: {args[0]}\nUse /bgtasks to list tasks.")
+            return
+
+        if task.status not in ("running", "pending"):
+            self._send(
+                chat_id,
+                f"Task [{task.short_id()}] is already {task.status} — nothing to cancel."
+            )
+            return
+
+        runner = get_bg_runner(verbose=self.verbose)
+        flagged = runner.cancel(chat_id, task.task_id)
+
+        if flagged:
+            self._send(
+                chat_id,
+                f"Cancel signal sent to task [{task.short_id()}].\n"
+                f"It will stop at the next tool-call boundary."
+            )
+        else:
+            # Task may not have a live thread (e.g. bot restarted); mark directly
+            from datetime import datetime
+            store.update_status(
+                chat_id, task.task_id, "cancelled",
+                finished_at=datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+            )
+            self._send(chat_id, f"Task [{task.short_id()}] marked as cancelled.")

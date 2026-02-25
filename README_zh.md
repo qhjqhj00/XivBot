@@ -20,6 +20,9 @@
 | | 笔记按论文存储于 `workspace/notes/` |
 | **阅读摘要** | `/digest` — 按时间维度生成结构化 Markdown 摘要文件 |
 | | 以 `.md` 附件形式发送 |
+| **后台任务** | `/backrun` — 将长时间的 Agent 任务提交到后台运行 |
+| | `/bgtasks` — 查看所有后台任务的状态 |
+| | `/bgresult` — 任务完成后获取 `.md` 结果文件 |
 | **多会话管理** | 每个聊天支持多个命名会话 |
 | | 创建、切换、软删除会话 |
 | **多平台** | Telegram（长轮询，无需公网地址） |
@@ -121,6 +124,48 @@ xivbot status                # 显示配置、会话数量、记忆统计
 
 ---
 
+## 后台任务
+
+对于耗时较长的 Agent 任务（如调研数十篇论文并批量写笔记），可使用 `/backrun` 将任务提交到后台运行，期间可继续正常聊天。
+
+```
+用户：/backrun 帮我调研 50 篇今年的 agentic memory paper，全部写好笔记，最后给我 md
+
+Bot： Background task started  [id: a1b2c3]
+      Use /bgtasks to check status.
+      Use /bgresult a1b2c3 to get the result when done.
+```
+
+随时查看进度：
+
+```
+用户：/bgtasks
+
+Bot： Background Tasks
+
+      1. [a1b2c3] 🔄 running     帮我调研 50 篇今年的 agentic memory...
+           started: 2026-02-25 14:30  → /bgcancel a1b2c3 to cancel
+```
+
+完成后获取结果 `.md` 文件：
+
+```
+用户：/bgresult 1
+
+Bot： 📎 20260225_143000_a1b2c3_result.md
+```
+
+| 命令 | 说明 |
+|------|------|
+| `/backrun <任务描述>` | 在后台启动一个长时 Agent 任务 |
+| `/bgtasks` | 列出所有后台任务及状态（pending / running / done / failed） |
+| `/bgresult <n>` | 获取第 `n` 个任务（或按短 ID）的结果，以 `.md` 文件发送 |
+| `/bgcancel <n>` | 在下一个工具调用边界处取消正在运行的任务 |
+
+每个后台任务使用**独立的 Agent 实例**（与当前会话完全隔离），最多支持 **40 轮工具调用**，适合批量研究工作流。
+
+---
+
 ## Agent 技能
 
 LLM 在对话中可自动调用以下工具：
@@ -209,8 +254,12 @@ Bot： 正在生成今天的阅读摘要…
 │       └── <arxiv_id>.json        ← 每篇论文的记忆卡片
 ├── notes/
 │   └── <arxiv_id>.json            ← 每篇论文的用户笔记
-└── digests/
-    └── digest_today_2026-02-25.md ← 生成的阅读摘要
+├── digests/
+│   └── digest_today_2026-02-25.md ← 生成的阅读摘要
+└── bg_tasks/
+    └── <chat_id>/
+        ├── <task_id>.json         ← 任务元数据（状态、时间戳、prompt）
+        └── <task_id>_result.md    ← 任务完成后的结果文件
 ```
 
 ---

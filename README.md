@@ -20,6 +20,9 @@ Ask natural-language research questions in your terminal or through **Telegram /
 | | Notes stored per-paper in `workspace/notes/` |
 | **Digest** | `/digest` — generate a structured Markdown reading digest for any date range |
 | | Digest sent as a `.md` file attachment |
+| **Background tasks** | `/backrun` — submit a long agentic task that runs in the background |
+| | `/bgtasks` — check status of all running / completed tasks |
+| | `/bgresult` — retrieve the result as a `.md` file when done |
 | **Sessions** | Multi-turn conversation sessions per chat |
 | | Create, switch, and soft-delete sessions |
 | **Platforms** | Telegram (long-polling, no public URL needed) |
@@ -121,6 +124,48 @@ Greeting words (`hi`, `hello`, `你好`, …) also show the status panel.
 
 ---
 
+## Background Tasks
+
+For long, multi-step agentic tasks (e.g. surveying dozens of papers and writing notes), use `/backrun` to run the task in the background while you continue chatting.
+
+```
+User:  /backrun 帮我调研 50 篇今年的 agentic memory paper，全部写好笔记，最后给我 md
+
+Bot:   Background task started  [id: a1b2c3]
+       Use /bgtasks to check status.
+       Use /bgresult a1b2c3 to get the result when done.
+```
+
+Check progress at any time:
+
+```
+User:  /bgtasks
+
+Bot:   Background Tasks
+
+       1. [a1b2c3] 🔄 running     帮我调研 50 篇今年的 agentic memory...
+            started: 2026-02-25 14:30  → /bgcancel a1b2c3 to cancel
+```
+
+Once complete, retrieve the result as a `.md` file:
+
+```
+User:  /bgresult 1
+
+Bot:   📎 20260225_143000_a1b2c3_result.md
+```
+
+| Command | Description |
+|---------|-------------|
+| `/backrun <task>` | Start a long agentic task in the background |
+| `/bgtasks` | List all background tasks with status (pending / running / done / failed) |
+| `/bgresult <n>` | Get the result of task number `n` or by short ID (sends `.md` file) |
+| `/bgcancel <n>` | Cancel a running task at the next tool-call boundary |
+
+Background tasks each get a **fresh agent** (isolated from your active session) with up to **40 tool-call turns**, suitable for batch research workflows.
+
+---
+
 ## Agent Skills
 
 The LLM can call these tools automatically during a conversation:
@@ -201,8 +246,12 @@ Digests are also saved to `workspace/digests/`.
 │       └── <arxiv_id>.json    ← memory card per paper
 ├── notes/
 │   └── <arxiv_id>.json        ← user notes per paper
-└── digests/
-    └── digest_today_2026-02-25.md
+├── digests/
+│   └── digest_today_2026-02-25.md
+└── bg_tasks/
+    └── <chat_id>/
+        ├── <task_id>.json     ← task metadata (status, timestamps, prompt)
+        └── <task_id>_result.md ← final result when done
 ```
 
 ---

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
@@ -62,13 +63,19 @@ class XivAgent:
 
     # ── public API ───────────────────────────────────────────────────────────
 
-    def query(self, question: str, reset: bool = False) -> str:
+    def query(
+        self,
+        question: str,
+        reset: bool = False,
+        cancel_flag: Optional[threading.Event] = None,
+    ) -> str:
         """
         Answer a research question using skills.
 
         Args:
-            question: The user question.
-            reset:    Clear conversation history before answering.
+            question:    The user question.
+            reset:       Clear conversation history before answering.
+            cancel_flag: Optional threading.Event; when set the loop exits early.
 
         Returns:
             Final answer as a string.
@@ -84,6 +91,11 @@ class XivAgent:
         ]
 
         for turn in range(self.max_turns):
+            if cancel_flag and cancel_flag.is_set():
+                answer = "(Task cancelled by user.)"
+                self._conversation.append({"role": "assistant", "content": answer})
+                return answer
+
             if self.verbose:
                 console.rule(f"[dim]Turn {turn + 1}[/dim]")
 
@@ -109,6 +121,11 @@ class XivAgent:
 
             # Execute each tool call
             for tc in msg.tool_calls:
+                if cancel_flag and cancel_flag.is_set():
+                    answer = "(Task cancelled by user.)"
+                    self._conversation.append({"role": "assistant", "content": answer})
+                    return answer
+
                 fn_name = tc.function.name
                 try:
                     fn_args = json.loads(tc.function.arguments or "{}")
@@ -487,3 +504,126 @@ def run_query(question: str, verbose: bool = False, session_id: str = "default")
 
     manager = get_session_manager(verbose=verbose)
     return manager.query(chat_id=session_id, question=question)
+
+
+# ── Background task runner ────────────────────────────────────────────────────
+
+BG_MAX_TURNS = 40   # Allow more turns for long batch tasks
+
+
+class BackgroundTaskRunner:
+    """
+    Runs long agentic tasks in daemon threads, independent of user sessions.
+
+    Each task gets a fresh XivAgent (so it never pollutes session history).
+    Results are written to disk as Markdown files and task status is
+    updated via BackgroundTaskStore throughout execution.
+    """
+
+    def __init__(self, verbose: bool = False):
+        self._verbose = verbose
+        self._lock = threading.Lock()
+        # task_id → threading.Event (cancel flag)
+        self._cancel_flags: Dict[str, threading.Event] = {}
+
+    def submit(self, chat_id: str, prompt: str) -> str:
+        """
+        Create a new background task and start it in a daemon thread.
+        Returns the task_id.
+        """
+        from .bg_task_store import get_bg_task_store
+
+        store = get_bg_task_store()
+        task = store.create(chat_id, prompt)
+        cancel_flag = threading.Event()
+        with self._lock:
+            self._cancel_flags[task.task_id] = cancel_flag
+
+        t = threading.Thread(
+            target=self._run_task,
+            args=(chat_id, task.task_id, prompt, cancel_flag),
+            daemon=True,
+            name=f"bgtask-{task.task_id[-6:]}",
+        )
+        t.start()
+        return task.task_id
+
+    def cancel(self, chat_id: str, task_id: str) -> bool:
+        """
+        Signal a running task to cancel at the next tool-call boundary.
+        Returns True if a cancel flag was found, False if task not tracked.
+        """
+        with self._lock:
+            flag = self._cancel_flags.get(task_id)
+        if flag is None:
+            return False
+        flag.set()
+        return True
+
+    # ── Worker ────────────────────────────────────────────────────────────────
+
+    def _run_task(
+        self,
+        chat_id: str,
+        task_id: str,
+        prompt: str,
+        cancel_flag: threading.Event,
+    ) -> None:
+        from .bg_task_store import get_bg_task_store
+        from datetime import datetime
+
+        store = get_bg_task_store()
+        now = lambda: datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+        store.update_status(chat_id, task_id, "running", started_at=now())
+
+        try:
+            llm = cfg.get_llm_config()
+            token = cfg.get_deepxiv_token()
+            agent = XivAgent(
+                api_key=llm["api_key"],
+                model=llm["model"],
+                base_url=llm.get("base_url"),
+                deepxiv_token=token,
+                max_turns=BG_MAX_TURNS,
+                verbose=self._verbose,
+                session_id="",
+                chat_id=chat_id,
+            )
+
+            result = agent.query(prompt, cancel_flag=cancel_flag)
+
+            if cancel_flag.is_set():
+                store.update_status(chat_id, task_id, "cancelled", finished_at=now())
+            else:
+                result_path = store.result_path(chat_id, task_id)
+                result_path.write_text(result, encoding="utf-8")
+                store.update_status(
+                    chat_id, task_id, "done",
+                    finished_at=now(),
+                    result_file=str(result_path),
+                )
+
+        except Exception as exc:
+            store.update_status(
+                chat_id, task_id, "failed",
+                finished_at=now(),
+                error=str(exc),
+            )
+        finally:
+            with self._lock:
+                self._cancel_flags.pop(task_id, None)
+
+
+# ── Singleton accessor ────────────────────────────────────────────────────────
+
+_bg_runner: Optional["BackgroundTaskRunner"] = None
+
+
+def get_bg_runner(verbose: bool = False) -> "BackgroundTaskRunner":
+    global _bg_runner
+    if _bg_runner is None:
+        _bg_runner = BackgroundTaskRunner(verbose=verbose)
+    elif verbose:
+        _bg_runner._verbose = True
+    return _bg_runner
