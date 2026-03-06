@@ -122,6 +122,41 @@ xivbot status                # 显示配置、会话数量、记忆统计
 
 发送 `hi`、`hello`、`你好` 等问候语也会显示状态面板。
 
+### Telegram 菜单模式（新增）
+
+Telegram 现在在“欢迎面板”里显示对话内 inline 菜单；普通回复默认不带菜单按钮。原 `/command` 依然可用。
+
+现在可通过 `/start`（或发送 `hi`，或 `/help`）打开欢迎操作面板并唤出菜单。
+
+每条普通回复底部也会带一行快捷菜单：
+- `🏠 欢迎页`  `ℹ️ 状态`  `🆕 新建会话`
+
+可随时一键回到欢迎面板、查看状态或开启新会话。
+
+| 菜单按钮 | 等效命令 / 行为 |
+|---------|------------------|
+| `ℹ️ Status` | `/status` |
+| `❓ Help` | 打开欢迎操作面板 |
+| `📚 Sessions` | `/sessions` |
+| `🆕 New Session` | `/newsession` |
+| `🔀 Switch Session` | 打开仅含 session 的子菜单（带会话细节），点选即可切换 |
+| `🗑 Delete Session` | `/deletesession`（继续按提示输入） |
+| `♻️ Reset Session` | `/reset` |
+| `📝 Note (Last Paper)` | `/note` |
+| `🆔 Note by arXiv ID` | 先输入 arXiv ID（等效 `/note <arxiv_id>`） |
+| `📄 Digest Today` | `/digest today` |
+| `🗓 Digest by Period` | 先输入时间范围（等效 `/digest <period>`） |
+| `🧵 Backrun Task` | 先输入任务描述（等效 `/backrun <task>`） |
+| `📋 BG Tasks` | `/bgtasks` |
+| `📥 BG Result` | 先输入任务编号/短 ID（等效 `/bgresult <n>`） |
+| `🛑 BG Cancel` | 先输入任务编号/短 ID（等效 `/bgcancel <n>`） |
+| `🚪 Cancel Pending` | 取消当前待输入步骤（等效 `/cancel`） |
+| `🌐 切换到 English / 中文` | 一键切换菜单与提示语语言 |
+
+所有二步输入流程都可通过 `/cancel` 取消。
+状态面板也会跟随当前菜单语言自动切换。
+在中文模式下，`会话列表` 与 `后台任务列表` 页面也会使用中文展示。
+
 ---
 
 ## 后台任务
@@ -299,6 +334,24 @@ XivBot 使用**长轮询**方式，无需公网 IP 或服务器配置。
 | `kimi` | 月之暗面 | moonshot-v1-32k |
 
 所有提供商均使用 OpenAI 兼容接口，切换提供商只需修改 `~/.xivbot/config.json`。
+
+也可以使用 [OpenRouter](https://openrouter.ai) 作为统一网关接入任意模型。
+
+---
+
+## 架构与性能优化
+
+| 优化项 | 说明 |
+|---|---|
+| **并行 Tool 执行** | LLM 单轮返回多个 tool call 时并发执行（ThreadPoolExecutor，最多 4 worker） |
+| **批量论文摘要** | `batch_paper_briefs` 并发获取最多 10 篇论文，而非逐个请求 |
+| **LLM 重试与退避** | 瞬态错误（超时、限流、502/503）自动重试最多 2 次，指数退避 |
+| **对话裁剪** | 超过 40 条消息的对话自动裁剪，防止上下文溢出 |
+| **配置缓存** | 配置文件在内存中缓存 5 秒，避免每次 API 调用都读磁盘 |
+| **HTTP 连接池** | Telegram / 飞书 bot 使用 `requests.Session` 复用连接 |
+| **飞书 Token 缓存** | tenant_access_token 缓存至接近过期，不再每次发消息都重新获取 |
+| **会话缓存** | 活跃会话在内存中 LRU 缓存（最多 32 个），减少磁盘 I/O |
+| **OpenAI 客户端复用** | 自动命名、笔记生成、Digest 共享同一个缓存的 OpenAI 客户端 |
 
 ---
 

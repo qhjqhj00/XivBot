@@ -12,6 +12,7 @@ import json
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 
 from rich.console import Console
@@ -26,8 +27,27 @@ from .skills import get_system_prompt, call_skill, get_openai_tools
 
 console = Console()
 
-MAX_TURNS = 20          # Maximum tool-call rounds per query
-MAX_TOKENS = 4096       # Max tokens per LLM response
+MAX_TURNS = 20
+MAX_TOKENS = 4096
+MAX_CONTEXT_MESSAGES = 40  # trim conversation beyond this to prevent context overflow
+LLM_MAX_RETRIES = 2
+LLM_RETRY_DELAY = 1.0  # seconds
+
+
+def _llm_call_with_retry(client, retries: int = LLM_MAX_RETRIES, **kwargs):
+    """Call client.chat.completions.create with exponential backoff retries."""
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            last_exc = exc
+            err_str = str(exc).lower()
+            retryable = any(k in err_str for k in ("timeout", "rate", "429", "502", "503", "connection"))
+            if not retryable or attempt == retries:
+                raise
+            time.sleep(LLM_RETRY_DELAY * (2 ** attempt))
+    raise last_exc  # unreachable, but satisfies type checkers
 
 
 # ── Agent class ───────────────────────────────────────────────────────────────
@@ -35,6 +55,7 @@ MAX_TOKENS = 4096       # Max tokens per LLM response
 class XivAgent:
     """
     Lightweight ReAct agent backed by any OpenAI-compatible LLM + DeepXiv skills.
+    Supports parallel tool execution when the LLM emits multiple tool calls.
     """
 
     def __init__(
@@ -69,21 +90,11 @@ class XivAgent:
         reset: bool = False,
         cancel_flag: Optional[threading.Event] = None,
     ) -> str:
-        """
-        Answer a research question using skills.
-
-        Args:
-            question:    The user question.
-            reset:       Clear conversation history before answering.
-            cancel_flag: Optional threading.Event; when set the loop exits early.
-
-        Returns:
-            Final answer as a string.
-        """
         if reset:
             self._conversation = []
 
         self._conversation.append({"role": "user", "content": question})
+        self._trim_conversation()
 
         messages = [
             {"role": "system", "content": get_system_prompt()},
@@ -99,7 +110,8 @@ class XivAgent:
             if self.verbose:
                 console.rule(f"[dim]Turn {turn + 1}[/dim]")
 
-            response = self.client.chat.completions.create(
+            response = _llm_call_with_retry(
+                self.client,
                 model=self.model,
                 messages=messages,
                 tools=self.tools,
@@ -110,51 +122,24 @@ class XivAgent:
 
             msg = response.choices[0].message
 
-            # No more tool calls → we have the final answer
             if not msg.tool_calls:
                 answer = msg.content or ""
                 self._conversation.append({"role": "assistant", "content": answer})
                 return answer
 
-            # Append assistant's tool-call message
             messages.append(msg.model_dump(exclude_unset=True))
 
-            # Execute each tool call
-            for tc in msg.tool_calls:
-                if cancel_flag and cancel_flag.is_set():
-                    answer = "(Task cancelled by user.)"
-                    self._conversation.append({"role": "assistant", "content": answer})
-                    return answer
+            # Execute tool calls in parallel when there are multiple
+            tool_results = self._execute_tools_parallel(
+                msg.tool_calls, cancel_flag
+            )
 
-                fn_name = tc.function.name
-                try:
-                    fn_args = json.loads(tc.function.arguments or "{}")
-                except json.JSONDecodeError:
-                    fn_args = {}
+            if cancel_flag and cancel_flag.is_set():
+                answer = "(Task cancelled by user.)"
+                self._conversation.append({"role": "assistant", "content": answer})
+                return answer
 
-                if self.verbose:
-                    console.print(
-                        f"[bold yellow]⚙ Skill:[/bold yellow] [cyan]{fn_name}[/cyan] "
-                        f"[dim]{json.dumps(fn_args, ensure_ascii=False)}[/dim]"
-                    )
-
-                result = call_skill(
-                    fn_name, fn_args, self.reader,
-                    session_id=self.session_id,
-                    chat_id=self.chat_id,
-                )
-
-                if self.verbose:
-                    preview = result[:300] + "…" if len(result) > 300 else result
-                    console.print(f"[dim]↳ {preview}[/dim]\n")
-
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": result,
-                    }
-                )
+            messages.extend(tool_results)
 
         # Reached max turns – ask the model to wrap up
         messages.append(
@@ -163,7 +148,8 @@ class XivAgent:
                 "content": "Please summarise what you've found so far and give a final answer.",
             }
         )
-        final_resp = self.client.chat.completions.create(
+        final_resp = _llm_call_with_retry(
+            self.client,
             model=self.model,
             messages=messages,
             max_tokens=MAX_TOKENS,
@@ -175,6 +161,78 @@ class XivAgent:
 
     def reset(self) -> None:
         self._conversation = []
+
+    # ── Private helpers ───────────────────────────────────────────────────────
+
+    def _execute_tools_parallel(
+        self,
+        tool_calls: list,
+        cancel_flag: Optional[threading.Event],
+    ) -> List[Dict[str, Any]]:
+        """Execute multiple tool calls concurrently and return results in order."""
+
+        def _run_one(tc):
+            fn_name = tc.function.name
+            try:
+                fn_args = json.loads(tc.function.arguments or "{}")
+            except json.JSONDecodeError:
+                fn_args = {}
+
+            if self.verbose:
+                console.print(
+                    f"[bold yellow]⚙ Skill:[/bold yellow] [cyan]{fn_name}[/cyan] "
+                    f"[dim]{json.dumps(fn_args, ensure_ascii=False)}[/dim]"
+                )
+
+            result = call_skill(
+                fn_name, fn_args, self.reader,
+                session_id=self.session_id,
+                chat_id=self.chat_id,
+            )
+
+            if self.verbose:
+                preview = result[:300] + "…" if len(result) > 300 else result
+                console.print(f"[dim]↳ {preview}[/dim]\n")
+
+            return {"role": "tool", "tool_call_id": tc.id, "content": result}
+
+        if len(tool_calls) == 1:
+            return [_run_one(tool_calls[0])]
+
+        # Parallel execution for multiple tool calls
+        results: Dict[str, Dict] = {}
+        with ThreadPoolExecutor(max_workers=min(len(tool_calls), 4)) as pool:
+            futures = {pool.submit(_run_one, tc): tc.id for tc in tool_calls}
+            for future in as_completed(futures):
+                if cancel_flag and cancel_flag.is_set():
+                    break
+                tc_id = futures[future]
+                try:
+                    results[tc_id] = future.result()
+                except Exception as exc:
+                    results[tc_id] = {
+                        "role": "tool",
+                        "tool_call_id": tc_id,
+                        "content": f"[Skill error] {exc}",
+                    }
+
+        # Return in original order
+        return [results[tc.id] for tc in tool_calls if tc.id in results]
+
+    def _trim_conversation(self) -> None:
+        """Keep conversation within MAX_CONTEXT_MESSAGES to prevent context overflow."""
+        if len(self._conversation) <= MAX_CONTEXT_MESSAGES:
+            return
+        # Keep the first message (initial context) and the most recent messages
+        trimmed = self._conversation[-MAX_CONTEXT_MESSAGES:]
+        trimmed.insert(0, {
+            "role": "system",
+            "content": (
+                f"[Earlier conversation ({len(self._conversation) - MAX_CONTEXT_MESSAGES} "
+                f"messages) was trimmed to save context space.]"
+            ),
+        })
+        self._conversation = trimmed
 
 
 # ── Terminal chat loop ────────────────────────────────────────────────────────
@@ -448,9 +506,8 @@ class SessionManager:
     def _auto_name(self, chat_id: str, session_id: str, first_question: str) -> None:
         """Call LLM to generate a short session name from the first question."""
         try:
-            from openai import OpenAI
             llm = cfg.get_llm_config()
-            client = OpenAI(api_key=llm["api_key"], base_url=llm.get("base_url"))
+            client = cfg.get_openai_client()
             resp = client.chat.completions.create(
                 model=llm["model"],
                 messages=[

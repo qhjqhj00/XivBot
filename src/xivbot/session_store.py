@@ -85,10 +85,15 @@ class Session:
 class SessionStore:
     """
     Thread-safe read/write access to per-chat sessions on disk.
+    Uses an in-memory cache (keyed by session_id) to avoid redundant disk reads
+    during hot-path operations like append_message.
     """
+
+    _MAX_CACHE = 32
 
     def __init__(self):
         self._lock = threading.Lock()
+        self._cache: Dict[str, Session] = {}
 
     # ── Directory helpers ─────────────────────────────────────────────────────
 
@@ -100,10 +105,15 @@ class SessionStore:
     def _session_path(self, chat_id: str, session_id: str) -> Path:
         return self._chat_dir(chat_id) / f"{session_id}.json"
 
+    def _cache_put(self, session: Session) -> None:
+        self._cache[session.session_id] = session
+        if len(self._cache) > self._MAX_CACHE:
+            oldest = min(self._cache, key=lambda k: self._cache[k].updated_at)
+            self._cache.pop(oldest, None)
+
     # ── CRUD ──────────────────────────────────────────────────────────────────
 
     def create(self, chat_id: str, name: str = "New Session") -> Session:
-        """Create and persist a new session."""
         now = _now()
         session_id = _make_id()
         session = Session(
@@ -117,40 +127,45 @@ class SessionStore:
         return session
 
     def save(self, session: Session) -> None:
-        """Persist session to disk."""
         with self._lock:
             path = self._session_path(session.chat_id, session.session_id)
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(session.to_dict(), f, ensure_ascii=False, indent=2)
+            self._cache_put(session)
 
     def load(self, chat_id: str, session_id: str) -> Optional[Session]:
-        """Load a session from disk. Returns None if not found."""
+        cached = self._cache.get(session_id)
+        if cached is not None:
+            return cached
         path = self._session_path(chat_id, session_id)
         if not path.exists():
             return None
         try:
             with open(path, "r", encoding="utf-8") as f:
-                return Session.from_dict(json.load(f))
+                s = Session.from_dict(json.load(f))
+            self._cache_put(s)
+            return s
         except (json.JSONDecodeError, KeyError):
             return None
 
     def list_sessions(self, chat_id: str, include_inactive: bool = False) -> List[Session]:
-        """Return sessions for a chat, sorted newest-first. Excludes soft-deleted by default."""
         chat_dir = self._chat_dir(chat_id)
         sessions = []
         for p in chat_dir.glob("*.json"):
+            if p.name.startswith("_"):
+                continue
             try:
                 with open(p, "r", encoding="utf-8") as f:
                     s = Session.from_dict(json.load(f))
                     if include_inactive or s.active:
                         sessions.append(s)
+                        self._cache_put(s)
             except Exception:
                 continue
         sessions.sort(key=lambda s: s.updated_at, reverse=True)
         return sessions
 
     def delete(self, chat_id: str, session_id: str) -> bool:
-        """Soft-delete: mark session as inactive. Returns True if it existed."""
         session = self.load(chat_id, session_id)
         if session is None:
             return False
@@ -160,7 +175,6 @@ class SessionStore:
         return True
 
     def rename(self, chat_id: str, session_id: str, name: str) -> None:
-        """Rename a session."""
         session = self.load(chat_id, session_id)
         if session:
             session.name = name
@@ -170,7 +184,6 @@ class SessionStore:
     def append_message(
         self, chat_id: str, session_id: str, role: str, content: str
     ) -> None:
-        """Append a message to an existing session and persist."""
         session = self.load(chat_id, session_id)
         if session:
             session.messages.append({"role": role, "content": content})

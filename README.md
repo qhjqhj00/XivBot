@@ -122,6 +122,41 @@ The same commands work on both Telegram and Feishu:
 
 Greeting words (`hi`, `hello`, `你好`, …) also show the status panel.
 
+### Telegram Menu Mode (new)
+
+Telegram now uses an in-chat inline menu on the welcome panel. Regular replies are text-only by default, and slash commands are still supported for power users.
+
+Use `/start` (or say `hi`, or `/help`) to open the welcome panel with quick operation guidance and menu buttons.
+
+Each normal bot reply also includes a one-line quick menu:
+- `🏠 Home`  `ℹ️ Status`  `🆕 New Session`
+
+So you can jump back to the welcome panel, check status, or start a fresh session anytime.
+
+| Menu Button | Equivalent command / behavior |
+|------------|-------------------------------|
+| `ℹ️ Status` | `/status` |
+| `❓ Help` | open the welcome panel |
+| `📚 Sessions` | `/sessions` |
+| `🆕 New Session` | `/newsession` |
+| `🔀 Switch Session` | opens a dedicated session-only menu with session details; tap one to switch |
+| `🗑 Delete Session` | `/deletesession` (follow prompt) |
+| `♻️ Reset Session` | `/reset` |
+| `📝 Note (Last Paper)` | `/note` |
+| `🆔 Note by arXiv ID` | prompts for arXiv ID (`/note <arxiv_id>`) |
+| `📄 Digest Today` | `/digest today` |
+| `🗓 Digest by Period` | prompts for period/date (`/digest <period>`) |
+| `🧵 Backrun Task` | prompts for task description (`/backrun <task>`) |
+| `📋 BG Tasks` | `/bgtasks` |
+| `📥 BG Result` | prompts for task number/short ID (`/bgresult <n>`) |
+| `🛑 BG Cancel` | prompts for task number/short ID (`/bgcancel <n>`) |
+| `🚪 Cancel Pending` | cancel pending multi-step input (same effect as `/cancel`) |
+| `🌐 Switch to 中文 / English` | switch the menu and prompts language immediately |
+
+All menu-driven multi-step flows can be cancelled with `/cancel`.
+The status panel language also follows your selected menu language.
+In Chinese mode, `Sessions` and `BG Tasks` list pages are also localized.
+
 ---
 
 ## Background Tasks
@@ -291,6 +326,24 @@ The bot listens on `0.0.0.0:<port>` (default 8080). If your server is behind NAT
 | `kimi` | Moonshot AI | moonshot-v1-32k |
 
 All providers use an OpenAI-compatible API — switching providers only requires updating `~/.xivbot/config.json`.
+
+You can also use [OpenRouter](https://openrouter.ai) as a unified gateway to access any model.
+
+---
+
+## Architecture & Performance
+
+| Optimization | Description |
+|---|---|
+| **Parallel tool execution** | When the LLM emits multiple tool calls in one turn, they execute concurrently (ThreadPoolExecutor, up to 4 workers) |
+| **Batch paper briefs** | `batch_paper_briefs` fetches up to 10 papers concurrently instead of sequentially |
+| **LLM retry with backoff** | Transient errors (timeout, rate-limit, 502/503) are retried up to 2 times with exponential backoff |
+| **Conversation trimming** | Conversations beyond 40 messages are automatically trimmed to prevent context overflow |
+| **Config caching** | Config file is cached in memory with 5s TTL — no disk read on every API call |
+| **HTTP connection pooling** | Telegram and Feishu bots reuse `requests.Session` for all HTTP calls |
+| **Feishu token caching** | Tenant access token is cached until near-expiry instead of re-fetched per message |
+| **Session store caching** | Active sessions are cached in memory (LRU, up to 32) to avoid redundant disk I/O |
+| **Centralized OpenAI client** | A single cached OpenAI client is shared across auto-naming, note generation, and digest |
 
 ---
 

@@ -231,7 +231,9 @@ def get_paper_metadata(arxiv_id: str, reader=None) -> str:
 @skill(
     description=(
         "Get a brief summary of an arXiv paper: TLDR, keywords, and citation count. "
-        "Much cheaper than reading the full paper – use this for a quick overview."
+        "Much cheaper than reading the full paper – use this for quick triage "
+        "(deciding whether the paper is worth deeper reading), not as the only "
+        "source when introducing a paper in detail."
     ),
     parameters={
         "type": "object",
@@ -404,17 +406,30 @@ def get_pmc_full(pmc_id: str, reader=None) -> str:
     },
 )
 def batch_paper_briefs(arxiv_ids: List[str], reader=None) -> str:
-    parts = []
-    for aid in arxiv_ids[:10]:  # cap at 10
-        brief = reader.brief(aid)
-        if brief:
-            parts.append(
-                f"[{aid}] {brief.get('title', 'N/A')}\n"
-                f"  Citations: {brief.get('citations', 0)}\n"
-                f"  TLDR: {brief.get('tldr', 'N/A')}"
-            )
-        else:
-            parts.append(f"[{aid}] Not found.")
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    ids = arxiv_ids[:10]
+
+    def _fetch(aid: str) -> str:
+        try:
+            brief = reader.brief(aid)
+            if brief:
+                return (
+                    f"[{aid}] {brief.get('title', 'N/A')}\n"
+                    f"  Citations: {brief.get('citations', 0)}\n"
+                    f"  TLDR: {brief.get('tldr', 'N/A')}"
+                )
+        except Exception:
+            pass
+        return f"[{aid}] Not found."
+
+    results: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=min(len(ids), 5)) as pool:
+        futures = {pool.submit(_fetch, aid): aid for aid in ids}
+        for f in as_completed(futures):
+            results[futures[f]] = f.result()
+
+    parts = [results[aid] for aid in ids]
     return "\n\n".join(parts) if parts else "No results."
 
 
@@ -603,8 +618,15 @@ the skill will show all stored papers as fallback so you can judge relevance.
 ## General strategy for new paper discovery
 
 1. Use search_papers to find relevant papers.
-2. Use get_paper_brief for a quick overview.
-3. Use read_paper_section or get_paper_preview before get_full_paper.
-4. Always include the full arXiv URL: https://arxiv.org/abs/<arxiv_id>.
-5. Be concise but complete.
+2. Use get_paper_brief for quick triage only (is this paper worth deeper reading?).
+3. Before introducing any paper in detail, call get_paper_metadata at least once.
+4. In paper introductions, include BOTH:
+   - author names (at least 1-3 representative authors), and
+   - affiliation/institution info when available.
+5. Never output institution/team-only intros without naming authors.
+6. If authors or affiliation are missing in metadata, explicitly say unavailable; never fabricate.
+7. When relevant, present institution + team style descriptions (e.g., "来自北京大学的 Di He 团队 ..."), but keep author names explicit.
+8. Use read_paper_section or get_paper_preview before get_full_paper.
+9. Always include the full arXiv URL: https://arxiv.org/abs/<arxiv_id>.
+10. Be concise but complete.
 """.strip()

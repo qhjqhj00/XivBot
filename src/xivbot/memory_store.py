@@ -103,7 +103,8 @@ class PaperMemory:
 
     def brief_text(self) -> str:
         """Short human-readable summary for recall results."""
-        kw = ", ".join(self.keywords[:5]) if self.keywords else "—"
+        clean_kw = [k for k in self.keywords if k is not None]
+        kw = ", ".join(clean_kw[:5]) if clean_kw else "—"
         dates = ", ".join(self.dates_accessed()[-3:])
         lines = [
             f"[{self.arxiv_id}] {self.title}",
@@ -218,7 +219,8 @@ class MemoryStore:
                         card.title = brief.get("title", "")
                         card.tldr = brief.get("tldr", "")
                         kw = brief.get("keywords", [])
-                        card.keywords = kw if isinstance(kw, list) else [kw]
+                        kw = kw if isinstance(kw, list) else [kw]
+                        card.keywords = [k for k in kw if k is not None]
                         card.abstract = brief.get("abstract", "")
                 except Exception:
                     pass

@@ -254,9 +254,8 @@ def build_digest(date_hint: str) -> "tuple[str, str] | tuple[None, None]":
     )
 
     # ── Call LLM ──────────────────────────────────────────────────────────────
-    from openai import OpenAI
     llm = cfg.get_llm_config()
-    client = OpenAI(api_key=llm["api_key"], base_url=llm.get("base_url"))
+    client = cfg.get_openai_client()
     resp = client.chat.completions.create(
         model=llm["model"],
         messages=[{"role": "user", "content": prompt}],

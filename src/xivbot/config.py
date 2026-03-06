@@ -4,11 +4,18 @@ Config is stored at ~/.xivbot/config.json
 """
 import json
 import os
+import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 CONFIG_DIR = Path.home() / ".xivbot"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+
+_cache_lock = threading.Lock()
+_cached_config: Optional[Dict[str, Any]] = None
+_cached_mtime: float = 0.0
+_CACHE_TTL = 5.0  # seconds before re-checking disk
 
 # Supported LLM providers with their default base URLs and suggested models
 PROVIDERS: Dict[str, Dict[str, Any]] = {
@@ -115,25 +122,42 @@ def ensure_config_dir() -> None:
 
 
 def load_config() -> Dict[str, Any]:
-    """Load config from disk, returning defaults for missing keys."""
+    """Load config from disk with in-memory caching (TTL-based invalidation)."""
+    global _cached_config, _cached_mtime
+
+    with _cache_lock:
+        now = time.monotonic()
+        if _cached_config is not None and (now - _cached_mtime) < _CACHE_TTL:
+            return _deep_copy(_cached_config)
+
     ensure_config_dir()
     if not CONFIG_FILE.exists():
-        return _deep_copy(DEFAULT_CONFIG)
+        result = _deep_copy(DEFAULT_CONFIG)
+    else:
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                stored = json.load(f)
+            result = _deep_merge(DEFAULT_CONFIG, stored)
+        except (json.JSONDecodeError, OSError):
+            result = _deep_copy(DEFAULT_CONFIG)
 
-    try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            stored = json.load(f)
-        return _deep_merge(DEFAULT_CONFIG, stored)
-    except (json.JSONDecodeError, OSError):
-        return _deep_copy(DEFAULT_CONFIG)
+    with _cache_lock:
+        _cached_config = _deep_copy(result)
+        _cached_mtime = time.monotonic()
+
+    return result
 
 
 def save_config(config: Dict[str, Any]) -> None:
-    """Persist config to disk."""
+    """Persist config to disk and invalidate cache."""
+    global _cached_config, _cached_mtime
     ensure_config_dir()
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
     os.chmod(CONFIG_FILE, 0o600)
+    with _cache_lock:
+        _cached_config = _deep_copy(config)
+        _cached_mtime = time.monotonic()
 
 
 def get(key_path: str, default: Any = None) -> Any:
@@ -186,6 +210,23 @@ def get_deepxiv_token() -> Optional[str]:
 
 def get_provider_info(provider_key: str) -> Optional[Dict[str, Any]]:
     return PROVIDERS.get(provider_key)
+
+
+_openai_client = None
+_openai_client_key: Optional[str] = None
+
+
+def get_openai_client():
+    """Return a cached OpenAI client using the current LLM config."""
+    global _openai_client, _openai_client_key
+    llm = get_llm_config()
+    cache_key = f"{llm.get('api_key')}|{llm.get('base_url')}"
+    if _openai_client is not None and _openai_client_key == cache_key:
+        return _openai_client
+    from openai import OpenAI
+    _openai_client = OpenAI(api_key=llm["api_key"], base_url=llm.get("base_url"))
+    _openai_client_key = cache_key
+    return _openai_client
 
 
 def get_workspace_dir() -> Path:

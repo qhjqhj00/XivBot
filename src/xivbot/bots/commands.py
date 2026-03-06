@@ -468,13 +468,12 @@ class CommandsMixin:
         self, chat_id: str, arxiv_id: str, title: str, instruction: str
     ) -> None:
         try:
-            from openai import OpenAI
             from deepxiv_sdk import Reader
             from .. import config as cfg
             from ..note_store import get_note_store
 
             llm = cfg.get_llm_config()
-            client = OpenAI(api_key=llm["api_key"], base_url=llm.get("base_url"))
+            client = cfg.get_openai_client()
             reader = Reader(token=cfg.get_deepxiv_token())
 
             paper_text = ""
